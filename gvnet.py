@@ -138,11 +138,6 @@ class GVNet(nn.Module):
             nn.Conv2d(C // 2, n_heads * n_points, 1),
         )
 
-        self.head_alpha = nn.Parameter(torch.full((n_heads,), 10.0))
-        self.out_proj = nn.Linear(n_heads, 1, bias=False)
-        with torch.no_grad():
-            self.out_proj.weight.fill_(1.0 / n_heads)
-
     def encode(self, x):
         feat = self.kp_proj(self.backbone(x))
         B, HK, H, W = feat.shape
@@ -155,19 +150,9 @@ class GVNet(nn.Module):
         pts = torch.matmul(probs, grid)
         return pts
 
-    def forward_episode(
-        self,
-        sx,
-        sy,
-        qx,
-        qy,
-        cfg: EpisodeCfg,
-        lam_area=0.001,
-        lam_sep=1.0,
-        lam_rep=0.5,
-        lam_cent=0.5,
-    ):
+    def forward_episode(self, sx, sy, qx, qy, cfg: EpisodeCfg):
         ways = cfg.ways
+
         s_pts = self.encode(sx)
         q_pts = self.encode(qx)
 
@@ -186,24 +171,11 @@ class GVNet(nn.Module):
         s_mask = s_mask_flat.view(Bs, Hh, self.grid_hw, self.grid_hw)
         q_mask = q_mask_flat.view(Bq, Hh, self.grid_hw, self.grid_hw)
 
-        proto_mask = torch.stack([s_mask[sy == c].mean(0) for c in range(ways)])
-        proto_cent = torch.stack([s_pts[sy == c].mean(0).mean(1) for c in range(ways)])
+        proto_mask = torch.stack([s_mask[sy == c].mean(0) for c in range(ways)])  # [ways, Hh, H, W]
 
-        head_iou = soft_iou(q_mask[:, None], proto_mask[None])
-        head_logits = head_iou * self.head_alpha[None, None, :]
-        logits = self.out_proj(head_logits).squeeze(-1)
+        head_iou = soft_iou(q_mask[:, None], proto_mask[None])  # [Bq, ways, Hh]
+        logits = head_iou.mean(-1)  # pure IoU: average over heads -> [Bq, ways]
 
-        reg_shape = lam_rep * (point_repulsion(s_pts_flat) + point_repulsion(q_pts_flat))
-        reg_area = lam_area * s_mask.mean()
-
-        proto_mask_h = proto_mask.permute(1, 0, 2, 3)
-        iou_matrix_h = soft_iou(proto_mask_h[:, :, None], proto_mask_h[:, None, :])
-        off_diag = ~torch.eye(ways, dtype=torch.bool, device=sx.device)
-        reg_sep = lam_sep * iou_matrix_h[:, off_diag].mean()
-
-        cent_h = proto_cent.permute(1, 0, 2)
-        reg_cent = lam_cent * centroid_repulsion_multi(cent_h, margin=0.5)
-
-        loss = F.cross_entropy(logits, qy) + reg_shape + reg_area + reg_sep + reg_cent
+        loss = F.cross_entropy(logits, qy)
         acc = (logits.argmax(-1) == qy).float().mean()
         return loss, acc, logits
